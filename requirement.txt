@@ -3,4 +3,5 @@ huggingface_hub
 langchain-community
 langchain-huggingface
 faiss-cpu
+InferenceClient
 sentence-transformers
