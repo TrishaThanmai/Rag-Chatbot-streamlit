@@ -1,11 +1,8 @@
 streamlit
-huggingface_hub
-langchain-community
+langchain==0.0.350
+langchain-community==0.0.20
 langchain-huggingface
 faiss-cpu
-sentence-transformers
-pydantic==1.10.13
-
-
-
+huggingface_hub
+pydantic<2
 
