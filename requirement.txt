@@ -7,8 +7,10 @@ InferenceClient
 sentence-transformers
 streamlit==1.38.0
 faiss-cpu==1.8.0.post1
+huggingface_hub
 langchain==0.2.14
 langchain-community==0.2.12
 langchain-huggingface==0.0.3
 pydantic==1.10.13
+
 
