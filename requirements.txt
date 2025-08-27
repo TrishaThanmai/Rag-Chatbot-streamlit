@@ -1,8 +1,8 @@
-streamlit
-langchain==0.0.350
-langchain-community==0.0.20
-langchain-huggingface
-faiss-cpu
-huggingface_hub
-pydantic<2
-
+streamlit==1.38.0
+huggingface_hub==0.24.6
+langchain==0.2.14
+langchain-community==0.2.12
+langchain-huggingface==0.0.3
+faiss-cpu==1.8.0.post1
+sentence-transformers==3.0.1
+pydantic==2.9.2
