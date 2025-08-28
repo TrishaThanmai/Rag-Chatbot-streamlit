@@ -1,148 +1,233 @@
+# streamlit_app.py
 import streamlit as st
-from pathlib import Path
-from huggingface_hub import InferenceClient
-from langchain_huggingface import HuggingFaceEmbeddings
+import os
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
-# ========== Streamlit Config ==========
-st.set_page_config(page_title="Fusion RAG Chatbot", page_icon="🤖", layout="centered")
-st.title("🤖 Fusion RAG Chatbot")
+# === Set Page Config ===
+st.set_page_config(page_title="Fusion RAG Chatbot", layout="wide")
+st.title("⚡ Fusion RAG Chatbot (Local LLM + FAISS)")
 
-# ========== Config ==========
-HF_TOKEN = st.secrets["HF_TOKEN"]   # Hugging Face token stored in Streamlit secrets
-APP_DIR = Path(__file__).resolve().parent
-FAISS_DIR = APP_DIR / "faiss_index"
-INDEX_NAME = "index"
-
+# === Configuration (Modify these paths/tokens as needed) ===
+FAISS_FOLDER = "content/faiss_index"  # Folder containing faiss.index, index.pkl, etc.
 EMBED_MODEL = "sentence-transformers/sentence-t5-large"
-LLM_MODEL = "google/gemma-2-9b"   # or meta-llama/Llama-3.2-3b-instruct
+LLM_MODEL = "meta-llama/Llama-2-7b-chat-hf"
+HF_TOKEN = "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"  # Replace with your token
 
-# ========== Cache Helpers ==========
+# Optional: Set environment variable (if not already set)
+os.environ["HUGGINGFACEHUB_API_TOKEN"] = HF_TOKEN
+
+
+# === Load Embedding Model & FAISS Vectorstore (Cached) ===
 @st.cache_resource
-def load_embeddings():
-    return HuggingFaceEmbeddings(model_name=EMBED_MODEL, model_kwargs={"device": "cpu"})
+def load_vectorstore():
+    if not os.path.exists(FAISS_FOLDER):
+        st.error(f"❌ FAISS index folder not found: {FAISS_FOLDER}")
+        st.info("Please ensure your FAISS files (index.faiss, index.pkl) are in the `content/faiss_index/` directory.")
+        return None
 
-def ensure_faiss(emb):
-    """Create FAISS index if missing, else load existing one."""
-    if not FAISS_DIR.exists():
-        st.warning("FAISS index not found, creating a new one...")
-        # Temporary fallback docs (replace with your real dataset later)
-        texts = [
-            "Fusion RAG retrieves documents with multiple queries.",
-            "Reciprocal Rank Fusion merges results for better accuracy.",
-            "This is a fallback document when no FAISS index is found."
-        ]
-        db = FAISS.from_texts(texts, emb)
-        db.save_local(str(FAISS_DIR), index_name=INDEX_NAME)
+    try:
+        st.info(f"🧠 Loading embedding model: {EMBED_MODEL}")
+        embedding = HuggingFaceEmbeddings(
+            model_name=EMBED_MODEL,
+            model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"}
+        )
+        db = FAISS.load_local(
+            FAISS_FOLDER,
+            embedding,
+            allow_dangerous_deserialization=True  # Required for loading serialized objects
+        )
+        st.success("✅ FAISS vectorstore loaded!")
+        return db.as_retriever(search_kwargs={"k": 3})
+    except Exception as e:
+        st.error(f"❌ Failed to load FAISS index: {e}")
+        return None
 
-    return FAISS.load_local(
-        folder_path=str(FAISS_DIR),
-        embeddings=emb,
-        index_name=INDEX_NAME,
-        allow_dangerous_deserialization=True,
-    )
 
+# === Load LLM and Tokenizer (Cached) ===
 @st.cache_resource
-def load_faiss(_emb):
-    return ensure_faiss(_emb)
+def load_llm():
+    try:
+        st.info(f"🦙 Loading LLM: {LLM_MODEL}... (this may take a minute)")
 
-@st.cache_resource
-def get_hf_client():
-    return InferenceClient(model=LLM_MODEL, token=HF_TOKEN)
+        tokenizer = AutoTokenizer.from_pretrained(
+            LLM_MODEL,
+            use_auth_token=HF_TOKEN,
+            trust_remote_code=True
+        )
 
-# Load resources
-embeddings = load_embeddings()
-db = load_faiss(embeddings)
-retriever = db.as_retriever(search_kwargs={"k": 4})
-client = get_hf_client()
+        model = AutoModelForCausalLM.from_pretrained(
+            LLM_MODEL,
+            use_auth_token=HF_TOKEN,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",  # Automatically uses GPU if available
+            trust_remote_code=True,
+            resume_download=True
+        )
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+        st.success("✅ LLM loaded successfully!")
+        return tokenizer, model
 
-# ========== Fusion RAG Utils ==========
+    except Exception as e:
+        st.error(f"❌ Failed to load LLM. Common issues:")
+        st.markdown(f"""
+        - Make sure you have access to **{LLM_MODEL}** on Hugging Face
+        - Your token is correct and has **gated model access**
+        - Run: `huggingface-cli login --token={HF_TOKEN}` locally if needed
+        - Error: `{e}`
+        """)
+        return None, None
+
+
+# === Fusion RAG Functions ===
 def generate_queries(original_query: str):
+    """Expand query into multiple perspectives."""
     return [
         original_query,
         f"Explain in detail: {original_query}",
-        f"What are the benefits of {original_query}?",
-        f"What are the challenges or drawbacks of {original_query}?",
+        f"What are the advantages of {original_query}?",
+        f"What are the challenges or limitations of {original_query}?",
         f"Give a real-world application of {original_query}"
     ]
 
+
 def reciprocal_rank_fusion(results_dict, k=60):
-    """Fuse multiple retrieval results using RRF."""
+    """Fuse results using Reciprocal Rank Fusion."""
     fused_scores = {}
-    for q, docs in results_dict.items():
+    for query, docs in results_dict.items():
         for rank, doc in enumerate(docs):
-            fused_scores[doc.page_content] = fused_scores.get(doc.page_content, 0) + 1 / (rank + k)
+            content = doc.page_content.strip()
+            if content:
+                fused_scores[content] = fused_scores.get(content, 0) + 1 / (rank + k)
     return sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
 
-def fusion_rag_answer(query: str):
-    # 1️ Generate multiple queries
+
+def fusion_rag_answer(query, retriever, tokenizer, model):
+    if not query or not query.strip():
+        return "Please ask a valid question."
+
+    query = query.strip()
+
+    # Step 1: Expand queries
     expanded_queries = generate_queries(query)
+    all_results = {}
 
-    # 2️ Retrieve documents for each query
-    all_results = {q: retriever.get_relevant_documents(q) for q in expanded_queries}
+    # Step 2: Retrieve for each query
+    with st.spinner("🔍 Retrieving relevant documents..."):
+        for q in expanded_queries:
+            try:
+                docs = retriever.get_relevant_documents(q)
+                all_results[q] = docs
+            except Exception as e:
+                st.warning(f"Retrieval failed for '{q}': {e}")
 
-    # 3️ Fuse results
+    # Step 3: RRF fusion
     reranked = reciprocal_rank_fusion(all_results)
+    if not reranked:
+        return "⚠️ No relevant documents retrieved."
 
-    # 4️ Build context from top docs
-    top_passages = [doc for doc, _ in reranked[:5]]
-    context = "\n\n".join(top_passages)
+    top_passages = [content for content, _ in reranked[:5]]
+    context = "\n\n---\n\n".join(top_passages)
 
-    # 5️ Create prompt
+    # Step 4: Build prompt
     prompt = f"""
-Imagine you are chatting with me as my study buddy. 
-I’ll give you some context, and you need to answer my question based on it.  
+You are a helpful AI assistant. Answer the user's question using **only** the context below.
 
-Here’s how I’d like you to reply:
-- Stick only to the details from the context. 
-- If the context doesn’t cover it, just say: 
-  "The context does not provide this information."
-- Write in a friendly, easy-to-follow way. 
-- Feel free to break things into short bullets if it helps."
+### Instructions:
+- Do NOT use prior knowledge.
+- If the context doesn't contain the answer, say: "The context does not provide this information."
+- Be concise and clear.
+- Use bullet points or short paragraphs.
 
-Context:
+### Context:
 {context}
 
-Question: {query}
+### Question:
+{query}
 
-Final Answer:
+### Answer:
 """
 
-    # 6️ Query Hugging Face Inference
-    response = client.text_generation(
-        prompt,
-        max_new_tokens=350,
-        temperature=0.2,
-        do_sample=False,
-        stream=False,
-    )
+    # Step 5: Generate with local LLM
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        with st.spinner("🧠 Generating answer..."):
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=256,
+                temperature=0.3,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                truncation=True
+            )
+        full_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    # 7️ Extract Answer
-    raw_answer = ""
-    if isinstance(response, str):
-        raw_answer = response
-    elif isinstance(response, dict) and "generated_text" in response:
-        raw_answer = response["generated_text"]
-    elif isinstance(response, list) and "generated_text" in response[0]:
-        raw_answer = response[0]["generated_text"]
+        # Extract only the answer part after "Answer:"
+        answer_start = full_output.find("### Answer:") + len("### Answer:")
+        answer = full_output[answer_start:].strip()
 
-    return raw_answer.split("Final Answer:", 1)[-1].strip()
+        if not answer or "context does not provide" in answer.lower():
+            return "The context does not provide this information."
+        return answer
+    except Exception as e:
+        return f"❌ Error during generation: {str(e)}"
 
-# ========== UI ==========
-query = st.text_input("Ask me something:")
 
-if query:
-    with st.spinner("Thinking..."):
-        answer = fusion_rag_answer(query)
-        st.session_state.chat_history.append({"question": query, "answer": answer})
+# === Load Resources ===
+retriever = load_vectorstore()
+tokenizer, model = load_llm()
 
-# Display Chat History
-if st.session_state.chat_history:
-    st.subheader("🤖 Conversation History")
-    for i, chat in enumerate(st.session_state.chat_history, 1):
-        st.markdown(f"**Q{i}:** {chat['question']}")
-        st.markdown(f"**A{i}:** {chat['answer']}")
-        st.markdown("---")
+# === Initialize Chat History ===
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Hello! Ask me anything based on your knowledge base."}
+    ]
+
+# === Chat Interface ===
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+user_input = st.chat_input("Ask a question...")
+
+if user_input and retriever and tokenizer and model:
+    # Append user message
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # Generate assistant response
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            response = fusion_rag_answer(user_input, retriever, tokenizer, model)
+            st.markdown(response)
+    st.session_state.messages.append({"role": "assistant", "content": response})
+
+# === Sidebar Info ===
+with st.sidebar:
+    st.header("📚 About")
+    st.markdown("""
+    This is a **Fusion RAG Chatbot** that:
+    - Uses **local FAISS** vector store
+    - Loads **Llama-2-7b-chat-hf** locally
+    - Applies **query expansion + RRF**
+    - Runs fully offline after download
+
+    🔐 Your data never leaves this machine.
+    """)
+
+    st.subheader("📁 FAISS Index")
+    if os.path.exists(FAISS_FOLDER):
+        st.success("Index found")
+    else:
+        st.error("Index missing")
+
+    st.subheader("🦙 LLM Status")
+    if model:
+        device = model.device
+        st.success(f"Loaded on {device}")
+    else:
+        st.warning("LLM not loaded")
