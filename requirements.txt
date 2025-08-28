@@ -10,26 +10,3 @@ langchain-community
 langchain-text-splitters
 pypdf
 
-# Core
-streamlit>=1.32.0
-
-# Hugging Face + Transformers
-transformers>=4.42.0
-huggingface-hub>=0.23.0
-
-# Vector Search + LangChain
-faiss-cpu>=1.7.4
-langchain-community>=0.2.0
-langchain-huggingface>=0.0.3
-langchain-text-splitters>=0.0.1
-
-# Torch (CPU build works on Streamlit Cloud)
-torch>=2.2.0
-
-# PDF processing
-pypdf>=4.2.0
-
-# Utilities
-sentence-transformers>=2.7.0
-
-
