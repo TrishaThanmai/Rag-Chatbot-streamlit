@@ -1,8 +1,7 @@
-streamlit==1.38.0
-huggingface_hub==0.24.6
-langchain==0.2.14
-langchain-community==0.2.12
-langchain-huggingface==0.0.3
-faiss-cpu==1.7.4
-sentence-transformers==2.2.2
-pydantic==1.10.13
+streamlit
+torch
+transformers
+accelerate
+langchain-community
+faiss-cpu  # or faiss-gpu if using CUDA
+sentence-transformers
