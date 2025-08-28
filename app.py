@@ -44,8 +44,8 @@ with st.sidebar:
 
     llm_model_name = st.text_input(
         "LLM model (Transformers)",
-        value="google/gemma-2-9b",   # 🔥 changed here only
-        help="Use small models like 'TinyLlama/TinyLlama-1.1B-Chat-v1.0' for Streamlit Cloud"
+       value="google/gemma-2-9b",
+    help="Enter a Hugging Face model ID. Must have access. Example: 'google/gemma-2-9b', 'meta-llama/Llama-2-7b-chat-hf'"
     )
 
     # ✅ Add option to choose inference backend
