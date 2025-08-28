@@ -8,16 +8,20 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 
 # === Set Page Config ===
 st.set_page_config(page_title="Fusion RAG Chatbot", layout="wide")
-st.title("⚡ Fusion RAG Chatbot (Local LLM + FAISS)")
+st.title("⚡ Fusion RAG Chatbot (Local Gemma + FAISS)")
 
-# === Configuration (Modify these paths/tokens as needed) ===
-FAISS_FOLDER = "content/faiss_index"  # Folder containing faiss.index, index.pkl, etc.
+# === 🔧 Configuration - Update These Paths/Tokens ===
+# ✅ Update this to your actual FAISS folder path
+FAISS_FOLDER = r"C:\Users\trish\OneDrive\Desktop\Fusion Rag Streamlit\faiss_index"
+
+# Use a fully open model: Google's Gemma
+LLM_MODEL = "google/gemma-2b-it"  # Alternatives: "google/gemma-7b-it" (needs >10GB GPU VRAM)
+
+# Optional: Set your Hugging Face token here or in environment variable
+HF_TOKEN = "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"  # Replace with your actual token
+
+# Embedding model used when creating FAISS
 EMBED_MODEL = "sentence-transformers/sentence-t5-large"
-LLM_MODEL = "meta-llama/Llama-2-7b-chat-hf"
-HF_TOKEN = "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"  # Replace with your token
-
-# Optional: Set environment variable (if not already set)
-os.environ["HUGGINGFACEHUB_API_TOKEN"] = HF_TOKEN
 
 
 # === Load Embedding Model & FAISS Vectorstore (Cached) ===
@@ -25,7 +29,7 @@ os.environ["HUGGINGFACEHUB_API_TOKEN"] = HF_TOKEN
 def load_vectorstore():
     if not os.path.exists(FAISS_FOLDER):
         st.error(f"❌ FAISS index folder not found: {FAISS_FOLDER}")
-        st.info("Please ensure your FAISS files (index.faiss, index.pkl) are in the `content/faiss_index/` directory.")
+        st.info("💡 Make sure your FAISS files (index.faiss, index.pkl) are in the correct path.")
         return None
 
     try:
@@ -37,12 +41,13 @@ def load_vectorstore():
         db = FAISS.load_local(
             FAISS_FOLDER,
             embedding,
-            allow_dangerous_deserialization=True  # Required for loading serialized objects
+            allow_dangerous_deserialization=True
         )
         st.success("✅ FAISS vectorstore loaded!")
         return db.as_retriever(search_kwargs={"k": 3})
     except Exception as e:
         st.error(f"❌ Failed to load FAISS index: {e}")
+        st.exception(e)
         return None
 
 
@@ -50,7 +55,7 @@ def load_vectorstore():
 @st.cache_resource
 def load_llm():
     try:
-        st.info(f"🦙 Loading LLM: {LLM_MODEL}... (this may take a minute)")
+        st.info(f"🟢 Loading LLM: {LLM_MODEL}... (this may take a minute)")
 
         tokenizer = AutoTokenizer.from_pretrained(
             LLM_MODEL,
@@ -62,8 +67,9 @@ def load_llm():
             LLM_MODEL,
             use_auth_token=HF_TOKEN,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto",  # Automatically uses GPU if available
+            device_map="auto",
             trust_remote_code=True,
+            low_cpu_mem_usage=True,
             resume_download=True
         )
 
@@ -71,12 +77,13 @@ def load_llm():
         return tokenizer, model
 
     except Exception as e:
-        st.error(f"❌ Failed to load LLM. Common issues:")
+        st.error("❌ Failed to load LLM. Common issues:")
         st.markdown(f"""
-        - Make sure you have access to **{LLM_MODEL}** on Hugging Face
-        - Your token is correct and has **gated model access**
-        - Run: `huggingface-cli login --token={HF_TOKEN}` locally if needed
-        - Error: `{e}`
+        - Is your internet connection working?
+        - Did you set a valid `HF_TOKEN`?
+        - Try running:  
+          `huggingface-cli login --token={HF_TOKEN}` in terminal
+        - Error details: `{e}`
         """)
         return None, None
 
@@ -133,13 +140,12 @@ def fusion_rag_answer(query, retriever, tokenizer, model):
 
     # Step 4: Build prompt
     prompt = f"""
-You are a helpful AI assistant. Answer the user's question using **only** the context below.
+You are a helpful AI assistant. Answer based **only** on the context below.
 
 ### Instructions:
 - Do NOT use prior knowledge.
-- If the context doesn't contain the answer, say: "The context does not provide this information."
-- Be concise and clear.
-- Use bullet points or short paragraphs.
+- If the answer isn't in the context, say: "The context does not provide this information."
+- Be concise and structured.
 
 ### Context:
 {context}
@@ -169,9 +175,7 @@ You are a helpful AI assistant. Answer the user's question using **only** the co
         answer_start = full_output.find("### Answer:") + len("### Answer:")
         answer = full_output[answer_start:].strip()
 
-        if not answer or "context does not provide" in answer.lower():
-            return "The context does not provide this information."
-        return answer
+        return answer if answer else "The context does not provide this information."
     except Exception as e:
         return f"❌ Error during generation: {str(e)}"
 
@@ -186,25 +190,26 @@ if "messages" not in st.session_state:
         {"role": "assistant", "content": "Hello! Ask me anything based on your knowledge base."}
     ]
 
-# === Chat Interface ===
+# === Display Chat History ===
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
+# === User Input ===
 user_input = st.chat_input("Ask a question...")
 
 if user_input and retriever and tokenizer and model:
-    # Append user message
+    # Add user message
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Generate assistant response
+    # Generate and stream assistant response
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            response = fusion_rag_answer(user_input, retriever, tokenizer, model)
-            st.markdown(response)
+        response = fusion_rag_answer(user_input, retriever, tokenizer, model)
+        st.markdown(response)
     st.session_state.messages.append({"role": "assistant", "content": response})
+
 
 # === Sidebar Info ===
 with st.sidebar:
@@ -212,22 +217,21 @@ with st.sidebar:
     st.markdown("""
     This is a **Fusion RAG Chatbot** that:
     - Uses **local FAISS** vector store
-    - Loads **Llama-2-7b-chat-hf** locally
+    - Runs **Google's Gemma-2b** locally
     - Applies **query expansion + RRF**
-    - Runs fully offline after download
-
-    🔐 Your data never leaves this machine.
+    - No data leaves your machine
     """)
 
     st.subheader("📁 FAISS Index")
     if os.path.exists(FAISS_FOLDER):
-        st.success("Index found")
+        st.success("✅ Index found")
+        st.code(FAISS_FOLDER)
     else:
-        st.error("Index missing")
+        st.error("❌ Index not found")
 
-    st.subheader("🦙 LLM Status")
+    st.subheader("🟢 LLM Status")
     if model:
-        device = model.device
-        st.success(f"Loaded on {device}")
+        st.success(f"Loaded: {LLM_MODEL}")
+        st.write(f"Device: {model.device}")
     else:
-        st.warning("LLM not loaded")
+        st.warning("Not loaded")
