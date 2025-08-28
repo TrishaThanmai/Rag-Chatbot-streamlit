@@ -1,7 +1,10 @@
 streamlit
 torch
-transformers
+transformers>=4.38
 accelerate
+bitsandbytes
+faiss-cpu
+langchain-huggingface
 langchain-community
-faiss-cpu  # or faiss-gpu if using CUDA
-sentence-transformers
+langchain-text-splitters
+pypdf
