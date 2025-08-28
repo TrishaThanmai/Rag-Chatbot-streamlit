@@ -1,6 +1,7 @@
 streamlit
 torch
 transformers>=4.38
+sentence-transformers>=2.2.0
 accelerate
 bitsandbytes
 faiss-cpu
@@ -8,3 +9,4 @@ langchain-huggingface
 langchain-community
 langchain-text-splitters
 pypdf
+
