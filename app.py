@@ -7,6 +7,7 @@ import io
 import torch
 import streamlit as st
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from huggingface_hub import InferenceClient  # ✅ added
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -28,7 +29,6 @@ HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "").strip()
 if not HF_TOKEN:
     st.warning("No Hugging Face token found. Set `HF_TOKEN` in Streamlit secrets or env.")
     st.info("For public models like TinyLlama, you can leave it blank.")
-    # We'll proceed anyway since TinyLlama is public
 
 # =========================
 # Sidebar Controls
@@ -36,18 +36,24 @@ if not HF_TOKEN:
 with st.sidebar:
     st.header("⚙️ Settings")
 
-    # Embedding model
     embedding_model_name = st.text_input(
         "Embedding model",
         value="sentence-transformers/all-MiniLM-L6-v2",
         help="Used for semantic search in FAISS."
     )
 
-    # LLM model - CHANGED to TinyLlama (works on Streamlit Cloud)
     llm_model_name = st.text_input(
         "LLM model (Transformers)",
         value="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         help="Use small models like 'TinyLlama/TinyLlama-1.1B-Chat-v1.0' for Streamlit Cloud"
+    )
+
+    # ✅ Add option to choose inference backend
+    inference_mode = st.radio(
+        "LLM Inference Mode",
+        options=["local", "huggingface"],
+        index=0,
+        help="Run locally in Streamlit Cloud (local) or use Hugging Face Inference API (huggingface)"
     )
 
     temperature = st.slider("Temperature", 0.0, 1.5, 0.7, 0.05)
@@ -77,7 +83,7 @@ with st.sidebar:
 def get_embeddings(model_name: str):
     return HuggingFaceEmbeddings(
         model_name=model_name,
-        model_kwargs={"device": "cpu"}  # Fast enough on CPU
+        model_kwargs={"device": "cpu"}
     )
 
 
@@ -104,7 +110,6 @@ def _read_txt(file_bytes: bytes) -> str:
 
 
 def load_documents(files) -> list[dict]:
-    """Return list of dicts: {'source': filename, 'text': content}"""
     docs = []
     for f in files or []:
         name = f.name
@@ -127,7 +132,7 @@ def chunk_documents(raw_docs: list[dict], chunk_size=512, chunk_overlap=64):
     )
     chunks = []
     for d in raw_docs:
-        for i, c in enumerate(splitter.split_text(d["text"])):
+        for i, c in enumerate(splitter.split_text(d["text"])): 
             chunks.append({
                 "source": d["source"],
                 "chunk_id": f"{d['source']}#{i}",
@@ -158,36 +163,31 @@ def build_or_load_faiss(chunks: list[dict], embeddings, persist_path: str | None
 
 
 # =========================
-# Load LLM Model
+# Load LLM (Local Mode)
 # =========================
-@st.cache_resource(show_spinner="🚀 Loading LLM...")
+@st.cache_resource(show_spinner="🚀 Loading LLM...") 
 def load_local_model(model_name: str, token: str | None):
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # Simple chat template for TinyLlama
         if not tokenizer.chat_template:
             tokenizer.chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
 
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             token=token,
-            torch_dtype=torch.float32,  # CPU-safe; use float16 if GPU
-            device_map=None  # Let PyTorch handle it
+            torch_dtype=torch.float32,
+            device_map=None
         )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        if device == "cuda":
-            model = model.to(device).eval()
-        else:
-            model = model.eval()
-
+        model = model.to(device).eval()
         return tokenizer, model, device
 
     except Exception as e:
-        st.error("❌ Failed to load model. Check model name or your internet.")
+        st.error("❌ Failed to load local model")
         st.exception(e)
         st.stop()
         return None, None, None
@@ -210,7 +210,6 @@ if raw_docs:
         st.success(f"✅ Indexed {len(chunks)} chunks from {len(raw_docs)} file(s).")
 elif persist_dir and Path(persist_dir).exists():
     with st.spinner("📂 Loading existing FAISS index..."):
-        # Dummy chunk to satisfy cache
         dummy_chunks = [{"text": "dummy", "source": "none", "chunk_id": "0"}]
         vectorstore = build_or_load_faiss(dummy_chunks, embeddings, persist_dir)
         st.success(f"📁 Loaded FAISS index from `{persist_dir}`.")
@@ -220,57 +219,75 @@ else:
 
 
 # =========================
-# Load LLM
+# Setup LLM Backend
 # =========================
-with st.spinner("📥 Downloading and loading LLM... This may take 1-2 minutes."):
-    try:
+if inference_mode == "local":
+    with st.spinner("📥 Downloading and loading LLM... This may take 1-2 minutes."):
         tokenizer, model, device = load_local_model(llm_model_name, HF_TOKEN)
-        st.success(f"🟢 Model loaded on `{device.upper()}`")
-    except Exception as e:
-        st.error("❌ Failed to load model. Try a smaller one like 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'")
-        st.exception(e)
-        st.stop()
+        st.success(f"🟢 Local model loaded on `{device.upper()}`")
+        inference_client = None
+else:
+    st.info("🌐 Using Hugging Face Inference API (remote)")
+    inference_client = InferenceClient(model=llm_model_name, token=HF_TOKEN)
+    tokenizer, model, device = None, None, "huggingface"
 
 
 # =========================
-# Format Prompt for TinyLlama
+# Prompt Formatting
 # =========================
 def format_prompt(question: str, context_chunks: list[str]) -> str:
     context = "\n".join([f"- {c}" for c in context_chunks]) if context_chunks else "No context provided."
     system_msg = "You are a helpful AI assistant. Use the context to answer the question. If unsure, say 'I don't know.'"
     user_msg = f"Context:\n{context}\n\nQuestion: {question}"
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_msg}
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return prompt
+
+    if inference_mode == "local":
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg}
+        ]
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        return f"{system_msg}\n\n{user_msg}"
 
 
+# =========================
+# Generate Answer
+# =========================
 def generate_answer(prompt: str, temperature: float, top_p: float, max_new_tokens: int) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            repetition_penalty=1.1
-        )
-    full_text = tokenizer.decode(output_ids[0], skip_special_tokens=False)
+    if inference_mode == "local":
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.1
+            )
+        full_text = tokenizer.decode(output_ids[0], skip_special_tokens=False)
+        if "<|im_start|>assistant" in full_text:
+            try:
+                answer = full_text.split("<|im_start|>assistant")[-1]
+                answer = answer.split("<|im_end|>")[0].strip()
+                return answer
+            except Exception:
+                pass
+        return full_text.strip()
 
-    # Extract assistant's reply
-    if "<|im_start|>assistant" in full_text:
+    else:  # Hugging Face Inference API
         try:
-            answer = full_text.split("<|im_start|>assistant")[-1]
-            answer = answer.split("<|im_end|>")[0].strip()
-            return answer
-        except Exception:
-            pass
-    return full_text.strip()
+            response = inference_client.text_generation(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p
+            )
+            return response.strip()
+        except Exception as e:
+            return f"❌ Hugging Face API error: {str(e)}"
 
 
 # =========================
@@ -324,7 +341,7 @@ for turn in reversed(st.session_state.history):
     with st.container(border=True):
         st.markdown(f"**🧑 You:** {turn['question']}")
         st.markdown(f"**🤖 Assistant:** {turn['answer']}")
-        st.caption(f"⏱️ {turn['latency']:.2f}s | Retrieved {len(turn['retrieved'])} chunks")
+        st.caption(f"⏱️ {turn['latency']:.2f}s | Retrieved {len(turn['retrieved'])} chunks | Mode: {inference_mode}")
         if show_chunks and turn["retrieved"]:
             with st.expander("🔎 View Retrieved Chunks"):
                 for i, r in enumerate(turn["retrieved"], 1):
@@ -336,7 +353,7 @@ for turn in reversed(st.session_state.history):
 # Footer
 # =========================
 st.divider()
-st.caption("""
-⚡ RAG Chatbot | Model: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Embeddings: `all-MiniLM-L6-v2`  
-Tip: Add `.streamlit/config.toml` with `[server]\nfileWatcherType = "none"` to avoid startup errors.
+st.caption(f"""
+⚡ RAG Chatbot | Model: `{llm_model_name}` | Embeddings: `{embedding_model_name}`  
+Mode: `{inference_mode}` | Tip: Add `.streamlit/config.toml` with `[server]\nfileWatcherType = "none"` to avoid startup errors.
 """)
